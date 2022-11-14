@@ -1,6 +1,17 @@
-import { ChronikClient, Tx } from "chronik-client";
+import { ChronikClient, Token, Tx } from "chronik-client";
+import { parseSLP, ParseResult, SendParseResult, GenesisParseResult, MintParseResult } from "slp-parser";
 import yargs from "yargs";
-import { hideBin } from 'yargs/helpers'
+import { hideBin } from 'yargs/helpers';
+import BigNumber from 'bignumber.js';
+
+interface SlpVout {
+  tokenQtyStr: string;
+  tokenQty: number;
+  isMintBaton?: boolean;
+}
+interface MapOutputScriptToSlpInfo {
+  [outputScript: string]: SlpVout
+};
 
 const args = yargs(hideBin(process.argv))
   .alias('v', 'version')
@@ -22,6 +33,10 @@ const args = yargs(hideBin(process.argv))
 
 const tokenId = (args as any)['token'];
 
+const txs: { [txid: string]: Tx } = {};
+const txIds: string[] = [];
+const outputs2Tokens: MapOutputScriptToSlpInfo = {};
+
 const chronik = new ChronikClient('https://chronik.be.cash/xec');
 (async () => {
   try {
@@ -29,13 +44,11 @@ const chronik = new ChronikClient('https://chronik.be.cash/xec');
       console.log('Invalid token id');
       return;
     }
-    const tokenInfo = await chronik.token(tokenId);
-    const tx = await chronik.tx(tokenId);
-    if (!tx.slpTxData || !tx.slpTxData.genesisInfo) {
-      console.log('Invalid token. The token id is not equal to genesis transaction id');
-      return;
-    }
-    console.log(JSON.stringify(tx));
+    const token = await chronik.token(tokenId);
+
+    await parseChronikTokenTx(token, tokenId);
+
+    console.log(outputs2Tokens);
 
 
   } catch (error) {
@@ -44,12 +57,124 @@ const chronik = new ChronikClient('https://chronik.be.cash/xec');
   }
 })();
 
-export async function parseChronikTx(tx: Tx) {
+/**
+ * Recursive parse the token transaction data
+ * @param tx The transaction result from chronik
+ * @returns 
+ */
+export async function parseChronikTokenTx(token: Token, txid: string) {
+
+  const tx = await chronik.tx(txid);
+
+  console.log(txid);
 
   const { inputs, outputs } = tx;
 
-  // Iterate over inputs to see if this is an incoming tx (incoming === true)
-  for (let i = 0; i < inputs.length; i += 1) {
-    
+  const opReturnHex = outputs[0].outputScript;
+
+  // The list of transactions which spend slp output in this transaction
+  const sepndTxs: string[] = [];
+
+  let parsedTokenResult: ParseResult;
+  try {
+    const parsedTokenResult = parseSLP(Buffer.from(opReturnHex, 'hex'));
+
+    const { tokenType, transactionType, data } = parsedTokenResult;
+
+    // Process TX inputs
+    for (let i = 0; i < inputs.length; i++) {
+      const input = inputs[i];
+      const outScriptOfInput = input.outputScript;
+    }
+
+    // Iterate over outputs
+    for (let i = 0; i < outputs.length; i += 1) {
+      const thisOutput = outputs[i];
+      if (tokenType !== 1) {
+        continue;
+      }
+
+      let thisVout: SlpVout;
+      let thisVin: any;
+
+      if (transactionType === 'SEND') {
+        if (i === 0) {
+          // OP_RETURN output, do nothing
+          continue;
+        }
+
+        // Non SLP outputs - do nothing
+        if (i > (data as SendParseResult).amounts.length) {
+          continue;
+        }
+
+        // SLP output
+        const rawQty = (data as SendParseResult).amounts[i - 1];
+        // Calculate the real quantity using a BigNumber, then convert it to a
+        // floating point number.
+        let realQty = new BigNumber(rawQty).dividedBy(
+          10 ** token.slpTxData.genesisInfo.decimals
+        );
+        thisVout = {
+          tokenQtyStr: realQty.toString(),
+          tokenQty: parseFloat(realQty.toString())
+        }
+        outputs2Tokens[thisOutput.outputScript] = thisVout;
+        if (thisOutput.spentBy && thisOutput.spentBy.txid) {
+          sepndTxs.push(thisOutput.spentBy.txid);
+        }
+      } else if (
+        transactionType === 'GENESIS' ||
+        transactionType === 'MINT'
+      ) {
+        let tokenQty = BigNumber(0); // Default value
+        if (i === 0) {
+          // OP_RETURN = do nothing
+          continue;
+        } else if (i === 1) {
+          // Only vout[1] of a Genesis or Mint transaction represents the tokens.
+          // Any other outputs in that transaction are normal BCH UTXOs.
+          tokenQty = (data as (GenesisParseResult | MintParseResult)).qty;
+
+          // Calculate the real quantity using a BigNumber, then convert it to a
+          // floating point number.
+          let realQty = new BigNumber(tokenQty).dividedBy(
+            10 ** token.slpTxData.genesisInfo.decimals
+          );
+          thisVout = {
+            tokenQtyStr: realQty.toString(),
+            tokenQty: parseFloat(realQty.toString())
+          }
+          outputs2Tokens[thisOutput.outputScript] = thisVout;
+          if (thisOutput.spentBy && thisOutput.spentBy.txid) {
+            sepndTxs.push(thisOutput.spentBy.txid);
+          }
+        } else if (i === (data as (GenesisParseResult | MintParseResult)).mintBatonVout) {
+          // Optional Mint baton
+          thisVout = {
+            tokenQtyStr: '0',
+            tokenQty: 0,
+            isMintBaton: true
+          }
+          outputs2Tokens[thisOutput.outputScript] = thisVout;
+          if (thisOutput.spentBy && thisOutput.spentBy.txid) {
+            sepndTxs.push(thisOutput.spentBy.txid);
+          }
+        } else {
+          // Not slp output
+          continue;
+        }
+      } else {
+        throw new Error('Unknown SLP Transaction type');
+      }
+    }
+
+    // Recursive process the spent transaction list
+    for (const tx of sepndTxs) {
+      await parseChronikTokenTx(token, tx);
+    }
+  } catch (err) {
+    // Error when parse the slp transaction
+    return;
   }
 }
