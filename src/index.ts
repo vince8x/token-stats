@@ -7,6 +7,8 @@ import BigNumber from 'bignumber.js';
 
 
 interface SlpVout {
+  outputScript: string;
+  txid: string;
   tokenQtyStr: string;
   tokenQty: number;
   isMintBaton?: boolean;
@@ -35,6 +37,8 @@ const args = yargs(hideBin(process.argv))
 
 const tokenId = (args as any)['token'];
 const outputs2Tokens: MapOutputScriptToSlpInfo = {};
+const processedTxs: { [txid: string]: boolean } = {};
+const spentOutputs: string[] = [];
 let tokensMinted = 0;
 
 const chronik = new ChronikClient('https://chronik.be.cash/xec');
@@ -44,21 +48,23 @@ const chronik = new ChronikClient('https://chronik.be.cash/xec');
       console.log('Invalid token id');
       return;
     }
+
     const token = await chronik.token(tokenId);
 
     await parseChronikTokenTx(token, tokenId);
-
+    
     const tokenOutputs = Object.values(outputs2Tokens);
 
-    const tokensCirculation = _.sumBy(tokenOutputs, 'tokenQty');
+    // Remove the spent output from token outputs
+    const unspentTokenOutputs = _.filter(tokenOutputs, item => !spentOutputs.includes(item.outputScript));
+
+    const tokensCirculation = _.sumBy(unspentTokenOutputs, 'tokenQty');
     const tokensBurned = tokensMinted - tokensCirculation;
 
     
     console.log('minted:',tokensMinted);
     console.log('burned:',tokensBurned);
     console.log('circulation:',tokensCirculation);
-
-    // console.log(outputs2Tokens);
 
   } catch (error) {
     console.error('Unable to process the transactions');
@@ -73,16 +79,22 @@ const chronik = new ChronikClient('https://chronik.be.cash/xec');
  */
 export async function parseChronikTokenTx(token: Token, txid: string) {
 
+  if (processedTxs[txid]) {
+    // already processed
+    // console.log('already processed: ', txid);
+    return;
+  }
   const tx = await chronik.tx(txid);
 
-  console.log(txid);
+  processedTxs[txid] = true;
+  // console.log(txid);
 
   const { inputs, outputs } = tx;
 
   const opReturnHex = outputs[0].outputScript;
 
   // The list of transactions which spend slp output in this transaction
-  const sepndTxs: string[] = [];
+  let spendTxs: string[] = [];
 
   let parsedTokenResult: ParseResult;
   try {
@@ -94,9 +106,7 @@ export async function parseChronikTokenTx(token: Token, txid: string) {
     for (let i = 0; i < inputs.length; i++) {
       const input = inputs[i];
       const outScriptOfInput = input.outputScript ?? '';
-      if (outputs2Tokens[outScriptOfInput]) {
-        delete outputs2Tokens[outScriptOfInput]
-      }
+      spentOutputs.push(outScriptOfInput);
     }
 
     // Iterate over outputs
@@ -127,12 +137,14 @@ export async function parseChronikTokenTx(token: Token, txid: string) {
           10 ** token.slpTxData.genesisInfo.decimals
         );
         thisVout = {
+          outputScript: thisOutput.outputScript,
+          txid: txid,
           tokenQtyStr: realQty.toString(),
           tokenQty: parseFloat(realQty.toString())
         }
         outputs2Tokens[thisOutput.outputScript] = thisVout;
         if (thisOutput.spentBy && thisOutput.spentBy.txid) {
-          sepndTxs.push(thisOutput.spentBy.txid);
+          spendTxs.push(thisOutput.spentBy.txid);
         }
       } else if (
         transactionType === 'GENESIS' ||
@@ -153,24 +165,28 @@ export async function parseChronikTokenTx(token: Token, txid: string) {
             10 ** token.slpTxData.genesisInfo.decimals
           );
           thisVout = {
+            outputScript: thisOutput.outputScript,
+            txid: txid,
             tokenQtyStr: realQty.toString(),
             tokenQty: parseFloat(realQty.toString())
           }
           outputs2Tokens[thisOutput.outputScript] = thisVout;
           if (thisOutput.spentBy && thisOutput.spentBy.txid) {
-            sepndTxs.push(thisOutput.spentBy.txid);
+            spendTxs.push(thisOutput.spentBy.txid);
           }
           tokensMinted += realQty.toNumber();
         } else if (i === (data as (GenesisParseResult | MintParseResult)).mintBatonVout) {
           // Optional Mint baton
           thisVout = {
+            outputScript: thisOutput.outputScript,
+            txid: txid,
             tokenQtyStr: '0',
             tokenQty: 0,
             isMintBaton: true
           }
           outputs2Tokens[thisOutput.outputScript] = thisVout;
           if (thisOutput.spentBy && thisOutput.spentBy.txid) {
-            sepndTxs.push(thisOutput.spentBy.txid);
+            spendTxs.push(thisOutput.spentBy.txid);
           }
         } else {
           // Not slp output
@@ -181,8 +197,11 @@ export async function parseChronikTokenTx(token: Token, txid: string) {
       }
     }
 
+
+    //  Deduplicate
+    spendTxs = _.uniq(spendTxs)
     // Recursive process the spent transaction list
-    for (const tx of sepndTxs) {
+    for (const tx of spendTxs) {
       await parseChronikTokenTx(token, tx);
     }
   } catch (err) {
