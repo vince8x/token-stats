@@ -2,7 +2,9 @@ import { ChronikClient, Token, Tx } from "chronik-client";
 import { parseSLP, ParseResult, SendParseResult, GenesisParseResult, MintParseResult } from "slp-parser";
 import yargs from "yargs";
 import { hideBin } from 'yargs/helpers';
+import * as _ from 'lodash';
 import BigNumber from 'bignumber.js';
+
 
 interface SlpVout {
   tokenQtyStr: string;
@@ -32,10 +34,8 @@ const args = yargs(hideBin(process.argv))
   }).parse();
 
 const tokenId = (args as any)['token'];
-
-const txs: { [txid: string]: Tx } = {};
-const txIds: string[] = [];
 const outputs2Tokens: MapOutputScriptToSlpInfo = {};
+let tokensMinted = 0;
 
 const chronik = new ChronikClient('https://chronik.be.cash/xec');
 (async () => {
@@ -48,8 +48,17 @@ const chronik = new ChronikClient('https://chronik.be.cash/xec');
 
     await parseChronikTokenTx(token, tokenId);
 
-    console.log(outputs2Tokens);
+    const tokenOutputs = Object.values(outputs2Tokens);
 
+    const tokensCirculation = _.sumBy(tokenOutputs, 'tokenQty');
+    const tokensBurned = tokensMinted - tokensCirculation;
+
+    
+    console.log('minted:',tokensMinted);
+    console.log('burned:',tokensBurned);
+    console.log('circulation:',tokensCirculation);
+
+    // console.log(outputs2Tokens);
 
   } catch (error) {
     console.error('Unable to process the transactions');
@@ -77,14 +86,17 @@ export async function parseChronikTokenTx(token: Token, txid: string) {
 
   let parsedTokenResult: ParseResult;
   try {
-    const parsedTokenResult = parseSLP(Buffer.from(opReturnHex, 'hex'));
+    parsedTokenResult = parseSLP(Buffer.from(opReturnHex, 'hex'));
 
     const { tokenType, transactionType, data } = parsedTokenResult;
 
     // Process TX inputs
     for (let i = 0; i < inputs.length; i++) {
       const input = inputs[i];
-      const outScriptOfInput = input.outputScript;
+      const outScriptOfInput = input.outputScript ?? '';
+      if (outputs2Tokens[outScriptOfInput]) {
+        delete outputs2Tokens[outScriptOfInput]
+      }
     }
 
     // Iterate over outputs
@@ -95,7 +107,6 @@ export async function parseChronikTokenTx(token: Token, txid: string) {
       }
 
       let thisVout: SlpVout;
-      let thisVin: any;
 
       if (transactionType === 'SEND') {
         if (i === 0) {
@@ -149,6 +160,7 @@ export async function parseChronikTokenTx(token: Token, txid: string) {
           if (thisOutput.spentBy && thisOutput.spentBy.txid) {
             sepndTxs.push(thisOutput.spentBy.txid);
           }
+          tokensMinted += realQty.toNumber();
         } else if (i === (data as (GenesisParseResult | MintParseResult)).mintBatonVout) {
           // Optional Mint baton
           thisVout = {
