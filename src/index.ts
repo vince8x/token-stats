@@ -36,9 +36,16 @@ const args = yargs(hideBin(process.argv))
   }).parse();
 
 const tokenId = (args as any)['token'];
+
+// List all valid tokens output
 const outputs2Tokens: MapOutputScriptToSlpInfo = {};
+
+// List txs already processed
 const processedTxs: { [txid: string]: boolean } = {};
+
+// List all output already spent
 const spentOutputs: string[] = [];
+
 let tokensMinted = 0;
 
 const chronik = new ChronikClient('https://chronik.be.cash/xec');
@@ -51,8 +58,10 @@ const chronik = new ChronikClient('https://chronik.be.cash/xec');
 
     const token = await chronik.token(tokenId);
 
+    console.log('Result from chronik:', token);
+
     await parseChronikTokenTx(token, tokenId);
-    
+
     const tokenOutputs = Object.values(outputs2Tokens);
 
     // Remove the spent output from token outputs
@@ -61,10 +70,10 @@ const chronik = new ChronikClient('https://chronik.be.cash/xec');
     const tokensCirculation = _.sumBy(unspentTokenOutputs, 'tokenQty');
     const tokensBurned = tokensMinted - tokensCirculation;
 
-    
-    console.log('minted:',tokensMinted);
-    console.log('burned:',tokensBurned);
-    console.log('circulation:',tokensCirculation);
+    console.log(unspentTokenOutputs);
+    console.log('minted:', tokensMinted);
+    console.log('burned:', tokensBurned);
+    console.log('circulation:', tokensCirculation);
 
   } catch (error) {
     console.error('Unable to process the transactions');
@@ -98,6 +107,7 @@ export async function parseChronikTokenTx(token: Token, txid: string) {
 
   let parsedTokenResult: ParseResult;
   try {
+
     parsedTokenResult = parseSLP(Buffer.from(opReturnHex, 'hex'));
 
     const { tokenType, transactionType, data } = parsedTokenResult;
@@ -206,6 +216,12 @@ export async function parseChronikTokenTx(token: Token, txid: string) {
     }
   } catch (err) {
     // Error when parse the slp transaction
+    // Not a valid slp transaction
+    for (let i = 0; i < inputs.length; i++) {
+      const input = inputs[i];
+      const outScriptOfInput = input.outputScript ?? '';
+      spentOutputs.push(outScriptOfInput);
+    }
     return;
   }
 }
